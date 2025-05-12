@@ -6,8 +6,10 @@ import random
 import argparse
 import os
 import numpy as np
+import pandas as pd
 import pickle
 
+from transformer_helpers import create_model
 from tree_projection_src import TreeProjection
 from tree_projection_src import (
     left_branching_parse,
@@ -114,7 +116,7 @@ class T5Wrapper(torch.nn.Module):
         return all_hidden_states[layer_id]
 
 
-def get_model(model_name, data, encoder_depth, **kwargs):
+def get_model(model_src, model_name, data, encoder_depth, **kwargs):
     if data == "cogs":
         _, in_vocab, out_vocab, _, _ = build_datasets()
     elif data == "geoquery":
@@ -127,17 +129,57 @@ def get_model(model_name, data, encoder_depth, **kwargs):
             use_singleton=kwargs["singleton"],
             use_no_commas=kwargs["no_commas"],
         )
+    elif data == "coco" and model_src == "local":
+        raise ValueError("COCO data is not supported for local models.")
 
-    base_tokenizer = AutoTokenizer.from_pretrained(model_name)
-    base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-    assert isinstance(base_model, T5ForConditionalGeneration)
-    model = T5Wrapper(base_model)
+    if model_src == "huggingface":
+        base_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        assert isinstance(base_model, T5ForConditionalGeneration)
+        model = T5Wrapper(base_model)
 
-    def tokenizer(s, add_special_tokens=True):
-        input_ids = base_tokenizer(s)["input_ids"]
-        if not add_special_tokens:
-            input_ids = input_ids[:-1]
-        return input_ids
+        def tokenizer(s, add_special_tokens=True):
+            input_ids = base_tokenizer(s)["input_ids"]
+            if not add_special_tokens:
+                input_ids = input_ids[:-1]
+            return input_ids
+    else:
+        N_HEADS = 4
+        VEC_DIM = 512
+        ENCODER_LAYERS = encoder_depth
+        DECODER_LAYERS = 2
+        if "mlm" in model_name:
+            model = create_model(
+                len(in_vocab),
+                len(out_vocab),
+                VEC_DIM,
+                N_HEADS,
+                ENCODER_LAYERS,
+                DECODER_LAYERS,
+                mode="mlm",
+            )
+        else:
+            model = create_model(
+                len(in_vocab),
+                len(out_vocab),
+                VEC_DIM,
+                N_HEADS,
+                ENCODER_LAYERS,
+                DECODER_LAYERS,
+            )
+        if len(model_name) > 0:
+            model.load_state_dict(torch.load(model_name, map_location=torch.device("cpu")))
+
+        def tokenizer_fn(model):
+            def fn(s, add_special_tokens=True):
+                if add_special_tokens:
+                    return [model.encoder_sos] + in_vocab(s) + [model.encoder_eos]
+                else:
+                    return in_vocab(s)
+
+            return fn
+
+        tokenizer = tokenizer_fn(model)
 
     # tokenizer = tokenizer_fn(model)
     return model, tokenizer
@@ -146,6 +188,7 @@ def get_model(model_name, data, encoder_depth, **kwargs):
 def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
     device = torch.device("cuda")
     model, tokenizer = get_model(
+        args.model_src,
         args.model_name,
         args.data,
         args.encoder_depth,
@@ -175,6 +218,7 @@ def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
     tree_projector = TreeProjection(
         model, tokenizer, sim_fn=args.sim_fn, normalize=True
     )
+    all_model_results = []
     for st in st_thresholds:
         # input_str: The man is eating bananas
         if st == args.layer_id:
@@ -202,12 +246,20 @@ def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
                     parses, gold_parses, take_best=False
                 )
                 all_scores[1][(st, 0)] = parsing_acc["f1"]
-            else:
+            elif gold_parses is not None:
                 parsing_acc = get_parsing_accuracy(parses, gold_parses)
                 all_scores[1][(st, 0)] = parsing_acc["f1"]
             all_scores[0][(st, 0)] = np.mean(scores)
             print("tscore: ", all_scores[0][(st, 0)])
-            print("tparseval: ", all_scores[1][(st, 0)])
+            if gold_parses is not None:
+                print("tparseval: ", all_scores[1][(st, 0)])
+        
+        model_results = [
+            dict(input_str=input_str, parse=parse, score=score)
+            for input_str, parse, score in zip(input_strs, parses, scores)
+        ]
+        model_results = pd.DataFrame(model_results)
+        all_model_results.append(model_results)
 
     if get_data_for_lw_parser:
         return all_parses[st_thresholds[0]]
@@ -233,6 +285,11 @@ def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
             os.makedirs(folder_name)
         with open("{}/{}.pickle".format(folder_name, model_name), "wb") as writer:
             pickle.dump(all_scores, writer)
+    for i, model_results in enumerate(all_model_results):
+        model_results.to_csv(
+            "{}/{}_layer_{}.csv".format(folder_name, model_name, st_thresholds[i]),
+            index=False,
+        )
 
 
 def set_seed(args):
@@ -244,6 +301,7 @@ def set_seed(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model_src", choices=["huggingface", "local"], default="huggingface")
     parser.add_argument("--model_name", type=str, default="pmedepal/t5-small-finetuned-cogs")
     parser.add_argument("--print_parses", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -254,7 +312,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data",
         type=str,
-        choices=["cogs", "pcfg", "geoquery"],
+        choices=["cogs", "pcfg", "geoquery", "coco"],
         default="cogs",
     )
     parser.add_argument("--singleton", action="store_true")
@@ -269,21 +327,35 @@ if __name__ == "__main__":
     if args.data == "cogs":
         dat_folder = "{}/data_utils/COGS_TREES".format(DATA_DIR)
         data_file = "{}/train.pickle".format(dat_folder)
+        input_strs, gold_parses = read_inputs_and_parses(data_file)
     elif args.data == "geoquery":
         dat_folder = "{}_trees".format(args.data)
         data_file = "{}/train.pickle".format(dat_folder)
-    else:
+        input_strs, gold_parses = read_inputs_and_parses(data_file)
+    elif args.data == "pcfg":
         data_file = "{}/pcfg_train_singleton_no_commas.pickle".format(args.base_folder)
+        input_strs, gold_parses = read_inputs_and_parses(data_file)
+    elif args.data == "coco":
+        data_file = "{}/data_utils/coco/subj_captions.csv".format(DATA_DIR)
+        all_captions = pd.read_csv(data_file)
+        input_strs = []
+        for row in all_captions.itertuples():
+            input_strs += [eval(row.captions)[0]]
+        gold_parses = None
 
     model_name = args.model_name.split("/")[-1].split(".")[0]
     print(model_name)
-    input_strs, gold_parses = read_inputs_and_parses(data_file)
     if args.data in ["cogs", "pcfg"]:
         sampled_idxs = random.sample(
             range(len(input_strs)), k=min(len(input_strs), 5000)
         )
         input_strs = [input_strs[idx] for idx in sampled_idxs]
         gold_parses = [gold_parses[idx] for idx in sampled_idxs]
+    # elif args.data == "coco":
+    #     sampled_idxs = random.sample(
+    #         range(len(input_strs)), k=min(len(input_strs), 5000)
+    #     )
+    #     input_strs = [input_strs[idx] for idx in sampled_idxs]
     if args.get_baselines:
         lbranch = [left_branching_parse(s) for s in input_strs]
         rbranch = [right_branching_parse(s) for s in input_strs]

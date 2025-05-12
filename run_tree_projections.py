@@ -7,6 +7,7 @@ import random
 import argparse
 import os
 import numpy as np
+import pandas as pd
 import pickle
 
 from tree_projection_src import TreeProjection
@@ -105,6 +106,7 @@ def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
     tree_projector = TreeProjection(
         model, tokenizer, sim_fn=args.sim_fn, normalize=True
     )
+    all_model_results = []
     for st in st_thresholds:
         # input_str: The man is eating bananas
         if st == args.layer_id:
@@ -138,6 +140,13 @@ def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
             all_scores[0][(st, 0)] = np.mean(scores)
             print("tscore: ", all_scores[0][(st, 0)])
             print("tparseval: ", all_scores[1][(st, 0)])
+        
+        model_results = [
+            dict(input_str=input_str, parse=parse, score=score)
+            for input_str, parse, score in zip(input_strs, parses, scores)
+        ]
+        model_results = pd.DataFrame(model_results)
+        all_model_results.append(model_results)
 
     if get_data_for_lw_parser:
         return all_parses[st_thresholds[0]]
@@ -163,6 +172,11 @@ def get_scores(args, input_strs, gold_parses, get_data_for_lw_parser=False):
             os.makedirs(folder_name)
         with open("{}/{}.pickle".format(folder_name, model_name), "wb") as writer:
             pickle.dump(all_scores, writer)
+    for i, model_results in enumerate(all_model_results):
+        model_results.to_csv(
+            "{}/{}_layer_{}.csv".format(folder_name, model_name, st_thresholds[i])
+        )
+
 
 
 def set_seed(args):
